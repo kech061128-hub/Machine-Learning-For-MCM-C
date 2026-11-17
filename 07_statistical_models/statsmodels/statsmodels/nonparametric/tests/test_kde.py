@@ -1,0 +1,707 @@
+from itertools import pairwise
+from pathlib import Path
+import warnings
+
+import numpy as np
+import numpy.testing as npt
+import pandas as pd
+import pytest
+from scipy import integrate, stats
+from scipy.integrate import IntegrationWarning
+
+from statsmodels.distributions.mixture_rvs import mixture_rvs
+from statsmodels.nonparametric import bandwidths
+from statsmodels.nonparametric.kde import (
+    KDEResult,
+    KDEUnivariate as KDE,
+    kdensity,
+    kdensityfft,
+)
+from statsmodels.nonparametric.linbin import fast_linbin
+from statsmodels.sandbox.nonparametric import kernels
+from statsmodels.tools.testing import warns_or_none
+
+# get results from Stata
+
+curdir = Path(__file__).resolve().parent
+rfname = Path(curdir).joinpath("results", "results_kde.csv")
+# print rfname
+KDEResults = pd.read_csv(rfname, dtype=float)
+
+rfname = Path(curdir).joinpath("results", "results_kde_univ_weights.csv")
+KDEWResults = pd.read_csv(rfname)
+
+# get results from R
+curdir = Path(__file__).resolve().parent
+rfname = Path(curdir).joinpath("results", "results_kcde.csv")
+# print rfname
+KCDEResults = pd.read_csv(rfname, dtype=float)
+
+# setup test data
+
+RANDOM_STATE = np.random.RandomState(12345)
+Xi = mixture_rvs(
+    [0.25, 0.75],
+    size=200,
+    dist=[stats.norm, stats.norm],
+    kwargs=(dict(loc=-1, scale=0.5), dict(loc=1, scale=0.5)),
+    rng=RANDOM_STATE,
+)
+
+
+class TestKDEExceptions:
+
+    @classmethod
+    def setup_class(cls):
+        cls.kde = KDE(Xi)
+        cls.weights_200 = np.linspace(1, 100, 200)
+        cls.weights_100 = np.linspace(1, 100, 100)
+
+    def test_check_is_fit_exception(self):
+        with pytest.raises(ValueError):
+            self.kde.evaluate(0)
+
+    def test_non_weighted_fft_exception(self):
+        with pytest.raises(NotImplementedError):
+            self.kde.fit(
+                kernel="gau",
+                gridsize=50,
+                weights=self.weights_200,
+                fft=True,
+                bw="silverman",
+            )
+
+    def test_wrong_weight_length_exception(self):
+        with pytest.raises(ValueError):
+            self.kde.fit(
+                kernel="gau",
+                gridsize=50,
+                weights=self.weights_100,
+                fft=False,
+                bw="silverman",
+            )
+
+    def test_non_gaussian_fft_exception(self):
+        with pytest.raises(NotImplementedError):
+            self.kde.fit(kernel="epa", gridsize=50, fft=True, bw="silverman")
+
+
+class CheckKDE:
+    decimal_density = 7
+
+    def test_density(self):
+        npt.assert_almost_equal(
+            self.res1.density, self.res_density, self.decimal_density
+        )
+
+    def test_evaluate(self):
+        # disable test
+        # fails for Epan, Triangular and Biweight, only Gaussian is correct
+        # added it as test method to TestKDEGauss below
+        # inDomain is not vectorized
+        # kde_vals = self.res1.evaluate(self.res1.support)
+        kde_vals = [np.squeeze(self.res1.evaluate(xi)) for xi in self.res1.support]
+        kde_vals = np.squeeze(kde_vals)  # kde_vals is a "column_list"
+        mask_valid = np.isfinite(kde_vals)
+        # TODO: nans at the boundaries
+        kde_vals[~mask_valid] = 0
+        npt.assert_almost_equal(kde_vals, self.res_density, self.decimal_density)
+
+
+class TestKDEGauss(CheckKDE):
+    @classmethod
+    def setup_class(cls):
+        cls.res1 = cls.result_factory()
+        cls.res_density = KDEResults["gau_d"]
+
+    @classmethod
+    def result_factory(cls):
+        return KDE(Xi).fit(kernel="gau", fft=False, bw="silverman")
+
+    def test_evaluate(self):
+        # kde_vals = self.res1.evaluate(self.res1.support)
+        kde_vals = [self.res1.evaluate(xi) for xi in self.res1.support]
+        kde_vals = np.squeeze(kde_vals)  # kde_vals is a "column_list"
+        mask_valid = np.isfinite(kde_vals)
+        # TODO: nans at the boundaries
+        kde_vals[~mask_valid] = 0
+        npt.assert_almost_equal(kde_vals, self.res_density, self.decimal_density)
+
+    # The following tests are regression tests
+    # Values have been checked to be very close to R 'ks' package (Dec 2013)
+    def test_support_gridded(self):
+        kde = self.res1
+        support = KCDEResults["gau_support"]
+        npt.assert_allclose(support, kde.support)
+
+    def test_cdf_gridded(self):
+        kde = self.res1
+        cdf = KCDEResults["gau_cdf"]
+        npt.assert_allclose(cdf, kde.cdf)
+
+    def test_sf_gridded(self):
+        kde = self.res1
+        sf = KCDEResults["gau_sf"]
+        npt.assert_allclose(sf, kde.sf)
+
+    def test_icdf_gridded(self):
+        kde = self.res1
+        icdf = KCDEResults["gau_icdf"]
+        npt.assert_allclose(icdf, kde.icdf)
+
+
+class TestKDEGaussPandas(TestKDEGauss):
+    @classmethod
+    def setup_class(cls):
+        cls.res1 = cls.result_factory()
+        cls.res_density = KDEResults["gau_d"]
+
+    @classmethod
+    def result_factory(cls):
+        return KDE(pd.Series(Xi)).fit(kernel="gau", fft=False, bw="silverman")
+
+
+class TestKDEEpanechnikov(CheckKDE):
+    @classmethod
+    def setup_class(cls):
+        cls.res1 = cls.result_factory()
+        cls.res_density = KDEResults["epa2_d"]
+
+    @classmethod
+    def result_factory(cls):
+        return KDE(Xi).fit(kernel="epa", fft=False, bw="silverman")
+
+
+class TestKDETriangular(CheckKDE):
+    @classmethod
+    def setup_class(cls):
+        cls.res1 = cls.result_factory()
+        cls.res_density = KDEResults["tri_d"]
+
+    @classmethod
+    def result_factory(cls):
+        return KDE(Xi).fit(kernel="tri", fft=False, bw="silverman")
+
+
+class TestKDEBiweight(CheckKDE):
+    @classmethod
+    def setup_class(cls):
+        cls.res1 = cls.result_factory()
+        cls.res_density = KDEResults["biw_d"]
+
+    @classmethod
+    def result_factory(cls):
+        return KDE(Xi).fit(kernel="biw", fft=False, bw="silverman")
+
+
+# FIXME: enable/xfail/skip or delete
+# NOTE: This is a knownfailure due to a definitional difference of Cosine kernel
+# class TestKDECosine(CheckKDE):
+#    @classmethod
+#    def setup_class(cls):
+#        res1 = KDE(Xi)
+#        res1.fit(kernel="cos", fft=False, bw="silverman")
+#        cls.res1 = res1
+#        cls.res_density = KDEResults["cos_d"]
+
+
+# weighted estimates taken from matlab so we can allow len(weights) != gridsize
+class TestKdeWeights(CheckKDE):
+
+    @classmethod
+    def setup_class(cls):
+        cls.res1 = cls.result_factory()
+        fname = Path(curdir).joinpath("results", "results_kde_weights.csv")
+        cls.res_density = pd.read_csv(fname, skiprows=1, header=None).values.squeeze()
+        cls.res_density2 = np.genfromtxt(Path(fname).open("rb"), skip_header=1)
+
+    @classmethod
+    def result_factory(cls):
+        weights = np.linspace(1, 100, 200)
+        return KDE(Xi).fit(
+            kernel="gau", gridsize=50, weights=weights, fft=False, bw="silverman"
+        )
+
+    def test_evaluate(self):
+        # kde_vals = self.res1.evaluate(self.res1.support)
+        kde_vals = [self.res1.evaluate(xi) for xi in self.res1.support]
+        kde_vals = np.squeeze(kde_vals)  # kde_vals is a "column_list"
+        mask_valid = np.isfinite(kde_vals)
+        # TODO: nans at the boundaries
+        kde_vals[~mask_valid] = 0
+        npt.assert_almost_equal(kde_vals, self.res_density, self.decimal_density)
+
+
+class TestKDEGaussFFT(CheckKDE):
+    @classmethod
+    def setup_class(cls):
+        cls.decimal_density = 2  # low accuracy because binning is different
+        cls.res1 = cls.result_factory()
+        rfname2 = Path(curdir).joinpath("results", "results_kde_fft.csv")
+        cls.res_density = pd.read_csv(rfname2, header=None).values.squeeze()
+
+    @classmethod
+    def result_factory(cls):
+        return KDE(Xi).fit(kernel="gau", fft=True, bw="silverman")
+
+
+class CheckKDEWeights:
+    kernel_name = "dummy_kernel"
+
+    @classmethod
+    def setup_class(cls):
+        cls.x = KDEWResults["x"]
+        cls.res1 = cls.result_factory()
+        cls.res_density = KDEWResults[cls.res_kernel_name]
+
+    @classmethod
+    def result_factory(cls):
+        weights = KDEWResults["weights"]
+        # default kernel was scott when reference values computed
+        return KDE(cls.x).fit(
+            kernel=cls.kernel_name, weights=weights, fft=False, bw="scott"
+        )
+
+    decimal_density = 7
+
+    @pytest.mark.xfail(
+        reason="Not almost equal to 7 decimals", raises=AssertionError, strict=True
+    )
+    def test_density(self):
+        npt.assert_almost_equal(
+            self.res1.density, self.res_density, self.decimal_density
+        )
+
+    def test_evaluate(self):
+        if self.kernel_name == "cos":
+            pytest.skip("Cosine kernel fails against Stata")
+        kde_vals = [self.res1.evaluate(xi) for xi in self.x]
+        kde_vals = np.squeeze(kde_vals)  # kde_vals is a "column_list"
+        npt.assert_almost_equal(kde_vals, self.res_density, self.decimal_density)
+
+    def test_compare(self):
+        xx = self.res1.support
+        kde_vals = [np.squeeze(self.res1.evaluate(xi)) for xi in xx]
+        kde_vals = np.squeeze(kde_vals)  # kde_vals is a "column_list"
+        mask_valid = np.isfinite(kde_vals)
+        # TODO: nans at the boundaries
+        kde_vals[~mask_valid] = 0
+        npt.assert_almost_equal(self.res1.density, kde_vals, self.decimal_density)
+
+        # regression test, not compared to another package
+        nobs = len(self.res1.endog)
+        kern = self.res1.kernel
+        v = kern.density_var(kde_vals, nobs)
+        v_direct = kde_vals * kern.L2Norm / kern.h / nobs
+        npt.assert_allclose(v, v_direct, rtol=1e-10)
+
+        ci = kern.density_confint(kde_vals, nobs)
+        crit = 1.9599639845400545  # stats.norm.isf(0.05 / 2)
+        hw = kde_vals - ci[:, 0]
+        npt.assert_allclose(hw, crit * np.sqrt(v), rtol=1e-10)
+        hw = ci[:, 1] - kde_vals
+        npt.assert_allclose(hw, crit * np.sqrt(v), rtol=1e-10)
+
+    def test_kernel_constants(self):
+        # Copy the kernel since attributes are set in the test
+        kern = self.result_factory().kernel
+
+        nc = kern.norm_const
+        # trigger numerical integration
+        kern._norm_const = None
+        nc2 = kern.norm_const
+        npt.assert_allclose(nc, nc2, rtol=1e-10)
+
+        l2n = kern.L2Norm
+        # trigger numerical integration
+        kern._L2Norm = None
+        l2n2 = kern.L2Norm
+        npt.assert_allclose(l2n, l2n2, rtol=1e-10)
+
+        v = kern.kernel_var
+        # trigger numerical integration
+        kern._kernel_var = None
+        v2 = kern.kernel_var
+        npt.assert_allclose(v, v2, rtol=1e-10)
+
+
+class TestKDEWGauss(CheckKDEWeights):
+    kernel_name = "gau"
+    res_kernel_name = "x_gau_wd"
+
+
+class TestKDEWEpa(CheckKDEWeights):
+    kernel_name = "epa"
+    res_kernel_name = "x_epan2_wd"
+
+
+class TestKDEWTri(CheckKDEWeights):
+    kernel_name = "tri"
+    res_kernel_name = "x_" + kernel_name + "_wd"
+
+
+class TestKDEWBiw(CheckKDEWeights):
+    kernel_name = "biw"
+    res_kernel_name = "x_bi_wd"
+
+
+class TestKDEWCos(CheckKDEWeights):
+    kernel_name = "cos"
+    res_kernel_name = "x_cos_wd"
+
+
+class TestKDEWCos2(CheckKDEWeights):
+    kernel_name = "cos2"
+    res_kernel_name = "x_cos_wd"
+
+
+class _TestKDEWRect(CheckKDEWeights):
+    # TODO in docstring but not in kernel_switch
+    kernel_name = "rect"
+    res_kernel_name = "x_rec_wd"
+
+
+class _TestKDEWPar(CheckKDEWeights):
+    # TODO in docstring but not implemented in kernels
+    kernel_name = "par"
+    res_kernel_name = "x_par_wd"
+
+
+class TestKdeRefit:
+    rs = np.random.RandomState(12345)
+    data1 = rs.randn(100) * 100
+    pdf = KDE(data1)
+    pdf.fit()
+
+    data2 = rs.randn(100) * 100
+    pdf2 = KDE(data2)
+    pdf2.fit()
+
+    for attr in ["icdf", "cdf", "sf"]:
+        assert not np.allclose(getattr(pdf, attr)[:10], getattr(pdf2, attr)[:10])
+
+
+class TestNormConstant:
+    def test_norm_constant_calculation(self):
+        custom_gauss = kernels.CustomKernel(lambda x: np.exp(-(x**2) / 2.0))
+        gauss_true_const = 0.3989422804014327
+        npt.assert_almost_equal(gauss_true_const, custom_gauss.norm_const)
+
+
+def test_kde_bw_positive():
+    # GH 6679
+    x = np.array(
+        [
+            4.59511985,
+            4.59511985,
+            4.59511985,
+            4.59511985,
+            4.59511985,
+            4.59511985,
+            4.59511985,
+            4.59511985,
+            4.59511985,
+            4.59511985,
+            5.67332327,
+            6.19847872,
+            7.43189192,
+        ]
+    )
+    kde = KDE(x)
+    kde.fit()
+    assert kde.bw > 0
+
+
+def test_fast_linbin_boundary_observations():
+    # GH 9556: an observation at the upper grid boundary (li == M - 1) was
+    # split onto gcnts[M], one past the end of the array, and observations
+    # in the first two bins were dropped, so the counts did not sum to nobs.
+    x = np.array([0.0, 0.3, 1.0])
+    counts = fast_linbin(x, 0.0, 1.0, 5)
+    npt.assert_allclose(counts, [1.0, 0.8, 0.2, 0.0, 1.0])
+
+    rs = np.random.RandomState(12345)
+    x = rs.standard_normal(200)
+    counts = fast_linbin(x, x.min(), x.max(), 512)
+    assert counts.shape == (512,)
+    npt.assert_allclose(counts.sum(), 200)
+    # linear binning preserves the first moment
+    grid = np.linspace(x.min(), x.max(), 512)
+    npt.assert_allclose(counts @ grid, x.sum())
+
+    # observations outside [a, b] are dropped, or moved to the end points
+    x = np.array([-1.0, 0.5, 2.0])
+    npt.assert_allclose(fast_linbin(x, 0.0, 1.0, 5), [0.0, 0.0, 1.0, 0.0, 0.0])
+    npt.assert_allclose(
+        fast_linbin(x, 0.0, 1.0, 5, trunc=0), [1.0, 0.0, 1.0, 0.0, 1.0]
+    )
+
+
+def test_kde_fft_cut_zero():
+    # GH 9556: with cut=0 the largest observation sits exactly on the last
+    # grid point; the FFT path wrote past the end of the bin counts and
+    # dropped the smallest observation, so the density integrated to 5/6.
+    x = [24.0, 43.0, 27.0, 15.0, 37.0, 8.82]
+    kde = KDE(x)
+    kde.fit(fft=True, cut=0)
+    density, support = kde.density, kde.support
+    integral = np.sum(0.5 * (density[1:] + density[:-1]) * np.diff(support))
+    npt.assert_allclose(integral, 1.0, atol=0.01)
+
+
+def test_fit_self():
+    rs = np.random.RandomState(38923801)
+    x = rs.standard_normal(100)
+    kde = KDE(x)
+    assert isinstance(kde, KDE)
+    assert isinstance(kde.fit(), KDE)
+
+
+class TestKDECustomBandwidth:
+    decimal_density = 7
+
+    @classmethod
+    def setup_class(cls):
+        cls.kde = KDE(Xi)
+        cls.weights_200 = np.linspace(1, 100, 200)
+        cls.weights_100 = np.linspace(1, 100, 100)
+
+    def test_check_is_fit_ok_with_custom_bandwidth(self):
+        def custom_bw(X, kern):
+            return np.std(X) * len(X)
+
+        kde = self.kde.fit(bw=custom_bw)
+        assert isinstance(kde, KDE)
+
+    def test_check_is_fit_ok_with_standard_custom_bandwidth(self):
+        # Note, we are passing the function, not the string - this is intended
+        kde = self.kde.fit(bw=bandwidths.bw_silverman)
+        s1 = kde.support.copy()
+        d1 = kde.density.copy()
+
+        kde = self.kde.fit(bw="silverman")
+
+        npt.assert_almost_equal(s1, kde.support, self.decimal_density)
+        npt.assert_almost_equal(d1, kde.density, self.decimal_density)
+
+    @pytest.mark.parametrize("fft", [True, False])
+    def test_check_is_fit_ok_with_float_bandwidth(self, fft):
+        # Note, we are passing the function, not the string - this is intended
+        kde = self.kde.fit(bw=bandwidths.bw_silverman, fft=fft)
+        s1 = kde.support.copy()
+        d1 = kde.density.copy()
+
+        kde = self.kde.fit(bw=kde.bw, fft=fft)
+
+        npt.assert_almost_equal(s1, kde.support, self.decimal_density)
+        npt.assert_almost_equal(d1, kde.density, self.decimal_density)
+
+
+@pytest.mark.parametrize("kernel", ["epa", "tri", "uni", "cos", "biw", "triw"])
+def test_entropy_finite_domain_kernel(kernel):
+    # Kernels with a bounded domain used to read the integration limits off
+    # the KDE instead of the kernel, which has no such attribute. GH#9917
+    kde = KDE(Xi).fit(kernel=kernel, fft=False, bw="silverman")
+
+    # quad hits the subdivision limit at the kinks of the kernel, scipy dependent
+    with warns_or_none(IntegrationWarning, match="The maximum number of subdivisions"):
+        entropy = kde.entropy
+
+    assert np.isfinite(entropy)
+
+
+def test_entropy_infinite_domain_kernel():
+    kde = KDE(Xi).fit(kernel="gau", fft=False, bw="silverman")
+
+    assert np.isfinite(kde.entropy)
+
+
+@pytest.mark.parametrize("kernel", ["epa", "tri", "uni"])
+def test_evaluate_outside_support(kernel):
+    # GH 7195: for bounded-support kernels, evaluate() returned nan when an
+    # evaluation point had no observation inside the kernel's support, and
+    # a scalar nan for the *whole* array of points in that case instead of
+    # per-point estimates. The density is zero where the kernel contributes
+    # nothing, not nan.
+    rng = np.random.RandomState(9876)
+    x = rng.normal(size=100)
+    dens = KDE(x).fit(kernel=kernel, bw="silverman", fft=False)
+    h = dens.kernel.h
+
+    outside = x.min() - 2.0 * h  # beyond the support of every observation
+    inside = x.min() - 0.5 * h  # closest observation is within its support
+
+    d_out = dens.evaluate(outside)
+    assert not np.isnan(d_out).any()
+    assert d_out[0] == 0.0
+
+    pts = np.array([outside, inside, x.mean()])
+    vals = dens.evaluate(pts)
+    assert vals.shape == (3,)
+    assert not np.isnan(vals).any()
+    assert vals[0] == 0.0
+    assert vals[2] > 0.0
+    # vectorized evaluation must match point-by-point evaluation, which
+    # already worked for individual in-support points
+    loop_vals = np.array([dens.evaluate(pt)[0] for pt in pts])
+    npt.assert_allclose(vals, loop_vals)
+
+
+BOUNDED_KERNELS = ["epa", "tri", "uni", "biw", "triw", "tric", "cos", "cos2"]
+
+
+@pytest.mark.parametrize("weighted", [False, True])
+@pytest.mark.parametrize("kernel", BOUNDED_KERNELS)
+def test_evaluate_bounded_kernels(kernel, weighted):
+    # GH 7195: all kernels with a bounded support, with and without weights
+    rng = np.random.default_rng(9876)
+    x = rng.normal(size=50)
+    weights = rng.uniform(0.5, 2.0, size=50) if weighted else None
+    dens = KDE(x).fit(kernel=kernel, bw="silverman", fft=False, weights=weights)
+    h = dens.kernel.h
+    lo, hi = dens.kernel.domain
+
+    pts = np.array(
+        [
+            x.min() + lo * h - 2.0 * h,  # outside, left
+            x.min() + 0.5 * lo * h,  # inside the support of the smallest obs
+            x.mean(),
+            x.max() + hi * h + 2.0 * h,  # outside, right
+        ]
+    )
+    vals = dens.evaluate(pts)
+    assert vals.shape == (4,)
+    assert not np.isnan(vals).any()
+    assert vals[0] == 0.0
+    assert vals[3] == 0.0
+    assert vals[1] > 0.0
+    assert vals[2] > 0.0
+
+    # brute force sum of the kernel over the observations in the support
+    w = np.full(50, 1 / 50) if weights is None else weights / weights.sum()
+    u = (x[:, None] - pts[None, :]) / h
+    in_support = (u >= lo) & (u <= hi)
+    shape = dens.kernel(np.clip(u, lo, hi))
+    expected = (np.where(in_support, shape, 0.0) * w[:, None]).sum(axis=0) / h
+    npt.assert_allclose(vals, expected, rtol=1e-12)
+
+    # list input, and a length 1 array, keep one density per point
+    npt.assert_allclose(dens.evaluate(list(pts)), vals)
+    assert dens.evaluate(pts[:1]).shape == (1,)
+    assert dens.evaluate(float(pts[0])).shape == (1,)
+
+
+def test_kernel_density_list_weights():
+    # weights set directly on a sandbox kernel can be a list
+    x = np.array([-0.3, 0.1, 0.8])
+    pts = np.array([-5.0, 0.0, 0.5])
+    weights = [0.2, 0.3, 0.5]
+    kern = kernels.Epanechnikov(h=0.7)
+    kern.weights = np.array(weights)
+    expected = kern.density(x, pts)
+    kern.weights = weights
+    npt.assert_allclose(kern.density(x, pts), expected)
+    npt.assert_allclose(kern.density(x, 0.5), expected[2:])
+
+
+@pytest.mark.parametrize("weighted", [False, True])
+@pytest.mark.parametrize("location", [0.0, 100.0])
+@pytest.mark.parametrize("kernel", BOUNDED_KERNELS)
+def test_cdf_entropy_bounded_kernels(kernel, location, weighted):
+    # cdf and entropy integrate the density over the kernel domain in the units
+    # of the data, not of the kernel
+    rng = np.random.default_rng(1234)
+    nobs = 15
+    x = rng.normal(size=nobs) + location
+    weights = rng.uniform(0.5, 2.0, size=nobs) if weighted else None
+    w = np.full(nobs, 1 / nobs) if weights is None else weights / weights.sum()
+    dens = KDE(x).fit(
+        kernel=kernel, bw="silverman", fft=False, weights=weights, gridsize=64
+    )
+    kern = dens.kernel
+    h = kern.h
+    lo, hi = kern.domain
+
+    cdf = dens.cdf
+    assert np.all(np.isfinite(cdf))
+    assert np.all(np.diff(cdf) >= -1e-10)
+    npt.assert_allclose(cdf[0], 0.0, atol=1e-10)
+    npt.assert_allclose(cdf[-1], 1.0, atol=1e-6)
+    npt.assert_allclose(dens.sf, 1 - cdf)
+
+    # the cdf of the mixture of the integrated kernel shapes
+    def kernel_cdf(u):
+        u = min(max(u, lo), hi)
+        return integrate.quad(lambda t: kern(np.asarray(t)), lo, u)[0]
+
+    for j in range(0, 64, 9):
+        u = (dens.support[j] - x) / h
+        expected = np.dot(w, [kernel_cdf(ui) for ui in u])
+        npt.assert_allclose(cdf[j], expected, atol=1e-6)
+
+    # integrate smooth pieces between the kinks of the density
+    breaks = np.unique(np.r_[x + lo * h, x, x + hi * h])
+
+    def entr(t):
+        pdf = dens.evaluate(t)[0]
+        return pdf * np.log(pdf + 1e-12)
+
+    expected = -sum(
+        integrate.quad(entr, a, b)[0] for a, b in pairwise(breaks)
+    )
+    # quad hits the subdivision limit at the kinks of the kernel, scipy dependent
+    with warns_or_none(IntegrationWarning, match="The maximum number of subdivisions"):
+        entropy = dens.entropy
+    assert np.isfinite(entropy)
+    npt.assert_allclose(entropy, expected, rtol=1e-3)
+
+
+@pytest.mark.parametrize("func", [kdensity, kdensityfft])
+def test_kdensity_result_object_default(func):
+    # retgrid=True (the default) yields a KDEResult with the same length and
+    # contents as the legacy (density, grid, bw) tuple, so it is adopted
+    # without a warning.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", category=FutureWarning)
+        res = func(Xi)
+    assert isinstance(res, KDEResult)
+    assert len(res) == 3
+
+    # retgrid=False does change shape, so that path still warns.
+    with pytest.warns(FutureWarning, match="result_object"):
+        res = func(Xi, retgrid=False)
+    assert not isinstance(res, KDEResult)
+    assert len(res) == 2
+
+
+@pytest.mark.parametrize("func", [kdensity, kdensityfft])
+def test_kdensity_result_object_true(func):
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", category=FutureWarning)
+        res = func(Xi, result_object=True)
+    assert isinstance(res, KDEResult)
+    assert res.grid is not None
+    assert res[0] is res.density
+    assert res[1] is res.grid
+    assert res[2] == res.bw
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", category=FutureWarning)
+        res = func(Xi, retgrid=False, result_object=True)
+    assert isinstance(res, KDEResult)
+    # The grid is computed regardless of retgrid, so it is reported rather
+    # than None-filled.
+    assert res.grid is not None
+
+
+def test_kde_univariate_negative_bw_raises():
+    # a negative bandwidth was previously accepted silently and produced
+    # negative densities from evaluate()
+    rng = np.random.RandomState(0)
+    x = rng.normal(size=50)
+    with pytest.raises(ValueError, match="bw must be positive"):
+        KDE(x).fit(bw=-0.5)
+    with pytest.raises(ValueError, match="bw must be positive"):
+        KDE(x).fit(bw=0)
+    dens = KDE(x).fit(bw=0.3).evaluate([0.0])
+    assert dens[0] > 0
