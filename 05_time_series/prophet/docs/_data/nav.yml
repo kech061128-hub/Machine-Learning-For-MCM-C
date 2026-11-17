@@ -1,0 +1,11 @@
+- title: Docs
+  href: docs/
+  category: docs
+
+- title: API Reference
+  href: api/
+  category: docs
+
+- title: GitHub
+  href: https://github.com/facebook/prophet
+  category: external

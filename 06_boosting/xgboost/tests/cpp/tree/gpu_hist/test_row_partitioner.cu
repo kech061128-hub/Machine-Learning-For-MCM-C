@@ -1,0 +1,295 @@
+/**
+ * Copyright 2019-2026, XGBoost Contributors
+ */
+#include <gtest/gtest.h>
+#include <thrust/count.h>  // for count_if
+#include <thrust/device_vector.h>
+#include <xgboost/base.h>
+#include <xgboost/tree_model.h>  // for RegTree
+
+#include <algorithm>  // for min, max
+#include <cstddef>    // for size_t
+#include <cstdint>    // for uint32_t
+#include <numeric>    // for iota
+#include <vector>     // for vector
+
+#include "../../../../src/data/ellpack_page.cuh"
+#include "../../../../src/tree/gpu_hist/expand_entry.cuh"  // for GPUExpandEntry
+#include "../../../../src/tree/gpu_hist/row_partitioner.cuh"
+#include "../../../../src/tree/param.h"  // for TrainParam
+#include "../../../../src/tree/sample_position.h"
+#include "../../collective/test_worker.h"  // for TestDistributedGlobal
+#include "../../helpers.h"                 // for RandomDataGenerator
+
+namespace xgboost::tree {
+void TestUpdatePositionBatch() {
+  const int kNumRows = 10;
+  auto ctx = MakeCUDACtx(0);
+  RowPartitioner rp;
+  rp.Reset(&ctx, kNumRows, 0);
+  auto rows = rp.GetRowsHost(0);
+  EXPECT_EQ(rows.size(), kNumRows);
+  for (auto i = 0ull; i < kNumRows; i++) {
+    EXPECT_EQ(rows[i], i);
+  }
+  std::vector<int> extra_data = {0};
+  // Send the first five training instances to the right node
+  // and the second 5 to the left node
+  rp.UpdatePositionBatch(&ctx, {0}, {1}, {2}, extra_data,
+                         [=] __device__(RowPartitioner::RowIndexT ridx, int) { return ridx > 4; });
+  rows = rp.GetRowsHost(1);
+  for (auto r : rows) {
+    EXPECT_GT(r, 4);
+  }
+  rows = rp.GetRowsHost(2);
+  for (auto r : rows) {
+    EXPECT_LT(r, 5);
+  }
+
+  // Split the left node again
+  rp.UpdatePositionBatch(&ctx, {1}, {3}, {4}, extra_data,
+                         [=] __device__(RowPartitioner::RowIndexT ridx, int) { return ridx < 7; });
+  EXPECT_EQ(rp.GetRows(3).size(), 2);
+  EXPECT_EQ(rp.GetRows(4).size(), 3);
+
+  // Send all rows of node 3 left, leaving node 6 empty.
+  rp.UpdatePositionBatch(&ctx, {3}, {5}, {6}, extra_data,
+                         [=] __device__(RowPartitioner::RowIndexT, int) { return true; });
+  // The leaves are in both buffers, and their segments aren't in node order.
+  dh::device_vector<bst_node_t> position(kNumRows, -1);
+  rp.FinalisePosition(&ctx, dh::ToSpan(position), 0,
+                      [] XGBOOST_DEVICE(bst_idx_t, bst_node_t nidx) { return nidx; });
+  std::vector<bst_node_t> h_position(position.size());
+  thrust::copy(position.begin(), position.end(), h_position.begin());
+  EXPECT_EQ(h_position, (std::vector<bst_node_t>{2, 2, 2, 2, 2, 5, 5, 4, 4, 4}));
+}
+
+TEST(RowPartitioner, Batch) { TestUpdatePositionBatch(); }
+
+void TestSortPositionBatch(const std::vector<int>& ridx_in, const std::vector<Segment>& segments,
+                           PartitionTileStates* p_state = nullptr) {
+  auto ctx = MakeCUDACtx(0);
+  thrust::device_vector<cuda_impl::RowIndexT> ridx = ridx_in;
+  thrust::device_vector<cuda_impl::RowIndexT> ridx_tmp(ridx_in.size());
+  thrust::device_vector<cuda_impl::RowIndexT> counts(segments.size());
+
+  // A hash of the row index, so the decisions don't follow the layout of the tiles.
+  auto op = [=] __device__(auto ridx, int data) {
+    return (ridx * 2654435761u) % 7 < 3;
+  };  // NOLINT
+  std::vector<int> op_data(segments.size());
+  std::vector<PerNodeData<int>> h_batch_info(segments.size());
+  dh::TemporaryArray<PerNodeData<int>> d_batch_info(segments.size());
+
+  std::size_t n_tiles = 0;
+  for (size_t i = 0; i < segments.size(); i++) {
+    h_batch_info[i] = {segments.at(i), 0, static_cast<cuda_impl::RowIndexT>(n_tiles)};
+    n_tiles += common::DivRoundUp(segments.at(i).Size(), cuda_impl::kPartitionTileRows);
+  }
+  dh::safe_cuda(cudaMemcpyAsync(d_batch_info.data().get(), h_batch_info.data(),
+                                h_batch_info.size() * sizeof(PerNodeData<int>), cudaMemcpyDefault,
+                                nullptr));
+  PartitionTileStates state;
+  RowBuffers<cuda_impl::RowIndexT> buffers{{dh::ToSpan(ridx), dh::ToSpan(ridx_tmp)}};
+  SortPositionBatch<decltype(op), int>(&ctx, dh::ToSpan(d_batch_info), buffers, dh::ToSpan(counts),
+                                       n_tiles, op, p_state ? p_state : &state);
+  // The rows of each node are read from the first buffer, and written to the second.
+  ridx = ridx_tmp;
+
+  auto op_without_data = [=] __device__(auto ridx) {
+    return (ridx * 2654435761u) % 7 < 3;
+  };  // NOLINT
+  std::vector<cuda_impl::RowIndexT> h_ridx(ridx.size());
+  thrust::copy(ridx.begin(), ridx.end(), h_ridx.begin());
+  for (size_t i = 0; i < segments.size(); i++) {
+    auto begin = ridx.begin() + segments[i].begin;
+    auto end = ridx.begin() + segments[i].end;
+    bst_uint count = counts[i];
+    auto left_partition_count =
+        thrust::count_if(thrust::device, begin, begin + count, op_without_data);
+    EXPECT_EQ(left_partition_count, count);
+    auto right_partition_count =
+        thrust::count_if(thrust::device, begin + count, end, op_without_data);
+    EXPECT_EQ(right_partition_count, 0);
+    // The left rows keep their order, the right rows are reversed.
+    std::vector<cuda_impl::RowIndexT> expected, right;
+    for (auto j = segments[i].begin; j < segments[i].end; ++j) {
+      cuda_impl::RowIndexT r = ridx_in[j];
+      ((r * 2654435761u) % 7 < 3 ? expected : right).push_back(r);
+    }
+    expected.insert(expected.end(), right.crbegin(), right.crend());
+    std::vector<cuda_impl::RowIndexT> got(h_ridx.cbegin() + segments[i].begin,
+                                          h_ridx.cbegin() + segments[i].end);
+    EXPECT_EQ(expected, got);
+  }
+}
+
+TEST(RowPartitioner, SortPositionBatch) {
+  TestSortPositionBatch({0, 1, 2, 3, 4, 5}, {{0, 3}, {3, 6}});
+  TestSortPositionBatch({0, 1, 2, 3, 4, 5}, {{0, 1}, {3, 6}});
+  TestSortPositionBatch({0, 1, 2, 3, 4, 5}, {{0, 6}});
+  TestSortPositionBatch({0, 1, 2, 3, 4, 5}, {{3, 6}, {0, 2}});
+  // Empty segments between and around non-empty ones.
+  TestSortPositionBatch({0, 1, 2, 3, 4, 5}, {{0, 0}, {0, 2}, {2, 2}, {2, 2}, {2, 6}, {6, 6}});
+  // Many segments of sizes 0 to 4, more nodes than the former batch limit of 32.
+  std::vector<int> ridx(97);
+  std::iota(ridx.begin(), ridx.end(), 0);
+  std::vector<Segment> segments;
+  for (cuda_impl::RowIndexT begin = 0; begin < ridx.size();) {
+    auto size = std::min<cuda_impl::RowIndexT>(begin % 5, ridx.size() - begin);
+    segments.emplace_back(begin, begin + size);
+    begin += std::max<cuda_impl::RowIndexT>(size, 1);
+  }
+  TestSortPositionBatch(ridx, segments);
+}
+
+TEST(RowPartitioner, SortPositionBatchTiles) {
+  // Nodes over many tiles, with the boundaries inside tiles.
+  std::vector<int> ridx(1 << 22);
+  std::iota(ridx.begin(), ridx.end(), 0);
+  TestSortPositionBatch(ridx, {{0, 1}, {1, 1025}, {1025, 5000}, {6000, 77777}, {80000, 1 << 22}});
+  std::vector<Segment> many;
+  for (cuda_impl::RowIndexT i = 0; i < 100; ++i) {
+    many.emplace_back(i * 3000, i * 3000 + i * 29);
+  }
+  TestSortPositionBatch(ridx, many);
+}
+
+TEST(RowPartitioner, SortPositionBatchReuseState) {
+  // The tile state is reset for the next launch, with launches of very different sizes.
+  std::vector<int> ridx(1 << 22);
+  std::iota(ridx.begin(), ridx.end(), 0);
+  PartitionTileStates state;
+  for (std::int32_t i = 0; i < 2; ++i) {
+    TestSortPositionBatch(ridx, {{0, 1 << 22}}, &state);
+    TestSortPositionBatch(ridx, {{0, 3000}, {3000, 3001}}, &state);
+    TestSortPositionBatch(ridx, {{5, 5}}, &state);
+    TestSortPositionBatch(ridx, {{7, 1 << 21}, {1 << 21, (1 << 22) - 1}}, &state);
+  }
+}
+
+namespace {
+void GetSplit(RegTree* tree, float split_value, std::vector<GPUExpandEntry>* candidates) {
+  CHECK(!tree->IsMultiTarget());
+  tree->Expand(
+      {{RegTree::kRoot, 0, split_value, true}, {0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}, 0.0f});
+  candidates->front().nidx = 0;
+  candidates->front().depth = 0;
+  candidates->front().split.fvalue = split_value;
+  candidates->front().split.findex = 0;
+}
+
+namespace {
+template <typename Accessor>
+struct LessThanOp {
+  Accessor acc;
+  explicit LessThanOp(Accessor acc) : acc{acc} {}
+  __device__ bool operator()(bst_idx_t ridx, RegTree::Node const& node) const {
+    auto fvalue = acc.GetFvalue(ridx, node.SplitIndex());
+    return fvalue <= node.SplitCond();
+  }
+};
+}  // namespace
+
+void TestExternalMemory() {
+  auto ctx = MakeCUDACtx(0);
+
+  bst_bin_t max_bin = 32;
+  auto p_fmat =
+      RandomDataGenerator{256, 16, 0.0f}.Batches(4).GenerateSparsePageDMatrix("temp", true);
+
+  std::vector<std::unique_ptr<RowPartitioner>> partitioners;
+  RegTree tree;
+  std::vector<GPUExpandEntry> candidates(1);
+
+  auto param = BatchParam{max_bin, TrainParam::DftSparseThreshold()};
+  float split_value{0.0f};
+  bst_feature_t const split_ind = 0;
+  dh::device_vector<bst_node_t> position(p_fmat->Info().num_row_, 0);
+
+  auto n_rows = p_fmat->Info().num_row_;
+  auto encode_op = [=] __device__(bst_idx_t ridx, bst_node_t nidx) {
+    return SamplePosition::Encode(nidx, ridx < n_rows / 2);
+  };  // NOLINT
+
+  for (auto const& page : p_fmat->GetBatches<EllpackPage>(&ctx, param)) {
+    if (partitioners.empty()) {
+      auto ptr = page.Impl()->Cuts().Ptrs()[split_ind + 1];
+      split_value = page.Impl()->Cuts().Values().at(ptr / 2);
+      GetSplit(&tree, split_value, &candidates);
+    }
+
+    partitioners.emplace_back(std::make_unique<RowPartitioner>());
+    partitioners.back()->Reset(&ctx, page.Size(), page.BaseRowId());
+    std::vector<RegTree::Node> splits{tree[0]};
+    page.Impl()->Visit(&ctx, {}, [&](auto&& acc) {
+      partitioners.back()->UpdatePositionBatch(&ctx, {0}, {1}, {2}, splits, LessThanOp{acc});
+    });
+    partitioners.back()->FinalisePosition(
+        &ctx, dh::ToSpan(position).subspan(page.BaseRowId(), page.Size()), page.BaseRowId(),
+        encode_op);
+  }
+
+  bst_idx_t n_left{0};
+  for (auto const& page : p_fmat->GetBatches<SparsePage>()) {
+    auto batch = page.GetView();
+    for (size_t i = 0; i < batch.Size(); ++i) {
+      if (batch[i][split_ind].fvalue < split_value) {
+        n_left++;
+      }
+    }
+  }
+
+  RegTree::Node node = tree[RegTree::kRoot];
+  auto n_left_pos = thrust::count_if(
+      position.cbegin(), position.cend(),
+      [=] XGBOOST_DEVICE(bst_node_t v) { return SamplePosition::Decode(v) == node.LeftChild(); });
+  ASSERT_EQ(n_left, n_left_pos);
+
+  // Each row gets the leaf holding it, encoded with its global row index.
+  std::vector<bst_node_t> h_position(position.size());
+  dh::CopyDeviceSpanToVector(&h_position, dh::ToSpan(position));
+  bst_idx_t n_checked = 0;
+  for (auto const& partitioner : partitioners) {
+    for (auto const& leaf : partitioner->GetLeaves()) {
+      for (auto ridx : partitioner->GetRowsHost(leaf.nidx)) {
+        ASSERT_EQ(SamplePosition::Decode(h_position.at(ridx)), leaf.nidx);
+        ASSERT_EQ(SamplePosition::IsValid(h_position[ridx]), ridx < n_rows / 2);
+        ++n_checked;
+      }
+    }
+  }
+  ASSERT_EQ(n_checked, n_rows);
+}
+}  // anonymous namespace
+
+TEST(RowPartitioner, LeafPartitionExternalMemory) { TestExternalMemory(); }
+
+namespace {
+void TestEmptyNode(std::int32_t n_workers) {
+  collective::TestDistributedGlobal(n_workers, [] {
+    auto ctx = MakeCUDACtx(DistGpuIdx());
+    RowPartitioner partitioner;
+    bst_idx_t n_samples = (collective::GetRank() == 0) ? 0 : 1024;
+    bst_idx_t base_rowid = 0;
+    partitioner.Reset(&ctx, n_samples, base_rowid);
+    std::vector<RegTree::Node> splits(1);
+    partitioner.UpdatePositionBatch(
+        &ctx, {0}, {1}, {2}, splits,
+        [] XGBOOST_DEVICE(bst_idx_t ridx, RegTree::Node) { return ridx < 3; });
+    ASSERT_EQ(partitioner.GetNumNodes(), 3);
+    if (collective::GetRank() == 0) {
+      for (std::size_t i = 0; i < 3; ++i) {
+        ASSERT_TRUE(partitioner.GetRows(i).empty());
+      }
+    }
+    ctx.CUDACtx()->Stream().Sync();
+  });
+}
+}  // anonymous namespace
+
+TEST(RowPartitioner, MGPUEmpty) {
+  std::int32_t n_workers = curt::AllVisibleGPUs();
+  TestEmptyNode(n_workers);
+}
+}  // namespace xgboost::tree

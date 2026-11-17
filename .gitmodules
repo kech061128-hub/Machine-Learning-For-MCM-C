@@ -1,0 +1,19 @@
+[submodule "06_boosting/xgboost/dmlc-core"]
+	path = 06_boosting/xgboost/dmlc-core
+	url = https://github.com/dmlc/dmlc-core
+	branch = main
+[submodule "06_boosting/LightGBM/include/boost/compute"]
+	path = 06_boosting/LightGBM/external_libs/compute
+	url = https://github.com/boostorg/compute
+[submodule "06_boosting/LightGBM/eigen"]
+	path = 06_boosting/LightGBM/external_libs/eigen
+	url = https://gitlab.com/libeigen/eigen.git
+[submodule "06_boosting/LightGBM/external_libs/fmt"]
+	path = 06_boosting/LightGBM/external_libs/fmt
+	url = https://github.com/fmtlib/fmt.git
+[submodule "06_boosting/LightGBM/external_libs/fast_double_parser"]
+	path = 06_boosting/LightGBM/external_libs/fast_double_parser
+	url = https://github.com/lemire/fast_double_parser.git
+[submodule "06_boosting/LightGBM/external_libs/nanoarrow"]
+	path = 06_boosting/LightGBM/external_libs/nanoarrow
+	url = https://github.com/apache/arrow-nanoarrow.git
